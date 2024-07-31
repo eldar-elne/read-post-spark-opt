@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Solving Data Skew and Spilling in Spark SQL</title>
+    <title>Solving Data Skew and Spilling in Spark</title>
     <style>
         h2 {
             margin-top: 50px;
@@ -95,7 +95,7 @@
           This imbalance can lead to inefficient processing, increased shuffle operations, and excessive memory usage, which ultimately results in performance degradation and even job failures due to spilling.
         </p>
         <p>
-          In a recent project, we hit a significant bottleneck in our Spark SQL queries.
+          In a recent project, we hit a significant bottleneck in our Spark jobs.
           Even though the query was logically correct, it performed poorly due to data skew and spilling.
         </p>
         <p>
@@ -140,7 +140,7 @@ LEFT JOIN agg b
   ON a.id = b.id
 GROUP BY a.col_a
         </code></pre>
-        <p>While this query was logically fine, it had a pretty long execution time of <b>25 minutes</b>:</p>
+        <p>While this query was logically fine, it suffered a long execution time of <b>25 minutes</b>:</p>
         <img src="assets/skew/total_time.png" alt="Spark Issue">
         
         <h2>The Solution</h2>
