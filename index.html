@@ -1,0 +1,220 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Solving Data Skew and Spilling in Spark SQL</title>
+    <style>
+        h2 {
+            margin-top: 50px;
+        }
+        h3 {
+            margin-top: 50px;
+        }        
+        body {
+            font-family: Arial, sans-serif;
+            line-height: 1.6;
+            margin: 0;
+            padding: 0;
+        }
+
+        header {
+            background: #333;
+            color: #fff;
+            padding: 1em 0;
+            text-align: center;
+        }
+
+        header h1 {
+            margin: 0;
+        }
+
+        section {
+            padding: 2em;
+            max-width: 800px;
+            margin: auto;
+        }
+
+        img {
+            max-width: 100%;
+            height: auto;
+        }
+
+        pre {
+            background: #f4f4f4;
+            padding: 1em;
+            border: 1px solid #ddd;
+            overflow-x: auto;
+        }
+
+        code {
+            background: #f4f4f4;
+            padding: 0.2em 0.4em;
+        }
+        .social-buttons {
+            display: flex;
+            justify-content: center;
+            gap: 15px;
+            margin: 20px 0;
+        }
+        .social-buttons a {
+            display: inline-block;
+            width: 50px;
+            height: 50px;
+            background-color: #e25a1c;
+            border-radius: 50%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            text-decoration: none;
+            color: #FFFFFF;
+            font-size: 24px;
+        }
+        .social-buttons img {
+            width: 30px;
+            height: 30px;
+        }
+        footer {
+            background-color: #ffffff;
+            color: #968585;
+            text-align: center;
+            padding: 1em 0;
+        }        
+    </style>
+</head>
+<body>
+    <header>
+        <h1>Solving Data Skews and Spilling in Spark</h1>
+    </header>
+    <section>
+        <img src="assets/spark_copy.png" alt="Spark" style="display: block; margin: auto; width: 40%;">
+
+        <h2>Intro</h2>
+        <p>
+          We all know that performance optimization in distributed computing frameworks like Spark can be challenging, especially when dealing with large datasets. One common issue that can drastically affect performance is *data skew – the uneven distribution of data across different partitions or nodes.
+          This imbalance can lead to inefficient processing, increased shuffle operations, and excessive memory usage, which ultimately results in performance degradation and even job failures due to spilling.
+        </p>
+        <p>
+          In a recent project, we hit a significant bottleneck in our Spark SQL queries.
+          Even though the query was logically correct, it performed poorly due to data skew and spilling.
+        </p>
+        <p>
+          In this post, we'll walk you through the problem we faced, the steps we took to diagnose and address the issue, and the results of our optimization efforts.
+        </p>
+        <p>We'll cover the following aspects:
+          <ul>
+            <li>Understanding data skew and its impact on performance</li>
+            <li>Techniques for mitigating skew</li>
+            <li>Adjustments to handle large shuffle operations more efficiently</li>
+          </ul>
+        </p> 
+        
+        <h2>The Problem</h2>
+        <p>Our initial query looked something like this:</p>
+        <pre><code>WITH agg AS (
+    SELECT
+      id,
+      COLLECT_SET(col_a) AS col_a_set,
+      COLLECT_SET(col_b) AS col_b_set
+    FROM some_table
+    WHERE
+        date = some_date
+        AND some_predicate IS NOT NULL
+    GROUP BY
+        id
+    )
+SELECT
+  a.col_a,
+  ARRAY_DISTINCT(
+    FLATTEN(
+      COLLECT_LIST(
+        CONCAT(
+          CASE WHEN CARDINALITY(col_a_set) < 40 THEN col_a_set ELSE ARRAY() END,
+          CASE WHEN CARDINALITY(col_b_set) < 40 THEN col_b_set ELSE ARRAY() END
+        )
+      )
+    )
+  ) AS ids_set
+FROM some_table a
+LEFT JOIN agg b
+  ON a.id = b.id
+GROUP BY a.col_a
+        </code></pre>
+        <p>While this query was logically fine, it had a pretty long execution time of <b>25 minutes</b>:</p>
+        <img src="assets/skew/total_time.png" alt="Spark Issue">
+        
+        <h2>The Solution</h2>
+        <h3>Step 1: Identify the issue</h3>
+        <p>
+          <li>First, we analyzed the stages and searched for the longest one:</li>
+        </p>
+        <img src="assets/skew/stage.png" alt="Spark Issue">
+        <p>At first glance, it looked like a skew/spilling issue.</p>
+        <p>
+          <li>Then, we listed all the tasks that stage executed and ordered them by the `Shuffle write` column to find the spilling task:</li>
+        </p>
+        <img src="assets/skew/task.png" alt="Spark Issue">
+        <p>It seems that the task is *skewed.</p>
+        <p>
+          <li>We searched for that stage (34) and task (11349) in the execution DAG to see which part of the query had the greatest impact on the execution time.</li>
+        </p>  
+        <p>Boom 💥, we found it:</p>
+        <img src="assets/skew/query.png" alt="Spark Issue">
+        
+        <h3>Step 2: Handling The Skew</h3>
+        <p>We ran a simple query and found the join column (<code>`id`</code>) was skewd:
+    <pre><code>>>> df = (spark
+        .table("some_table")
+        .filter(
+            (col("date") == "some_date")
+            & (col("some_predicate").isNotNull())
+        )
+        .groupBy("id")
+        .agg(count("*").alias("count_key"))
+        .orderBy("count_key", ascending=False)
+        )
+          
+>>> df.show(100, False)</code></pre>
+        <p>We had two options:
+          <ul>
+            <li>1. Repartition the data</li>
+            <li>2. Optimize the query and handle the skwed values separately</li>
+          </ul>
+          
+          We decided to repartition the data (<code>`RoundRobinPartitioning`</code>) since we didn't want to change the query logic.
+          With repartitioning, the data will spread evenly across all available partitions using the Spark SQL hint <code>/*+ REPARTITION(200) */</code>.</p>
+        </p>  
+    <pre><code>Same query with repartition:
+        
+WITH agg AS (
+    SELECT <b>/*+ REPARTITION(200) */</b>
+        id
+        ,COLLECT_SET(col_a) AS col_a_set
+...
+        </code></pre>
+        The decision to set 200 partitions was based on write metrics, as the whole stage writes ~18GiB, so now each partition will get <code>18GiB/200 = 90MiB</code>, meaning that we will have partitions with ~90MiB and keep the GC cycles as low as possible.
+        
+        <h2>Results</h2>
+        <p>
+          After making the change, we saw a significant improvement in query time by <b>90% (2.6 min!)</b>🤯 🤯 🤯. The data skew and spilling issues were gone.
+        </p>
+        <img src="assets/opt/total_time.png" alt="Performance Improvement">
+        
+        <h2>Conclusion</h2>
+        <p>Data skew and spilling are common issues in distributed computing and can sometimes be hard to identify.
+          By understanding the data distribution and applying techniques like repartitioning and salting, along with appropriate configuration tuning, you can significantly improve the performance of your Spark jobs.
+        </p>
+        <footer>
+          <div class="social-buttons">
+              <a href="https://www.linkedin.com/in/eldarel" target="_blank">
+                  <img src="https://upload.wikimedia.org/wikipedia/commons/c/ca/LinkedIn_logo_initials.png" alt="LinkedIn">
+              </a>
+              <a href="mailto:eldarelne@gmail.com" target="_blank">
+                  <img src="https://upload.wikimedia.org/wikipedia/commons/4/4e/Gmail_Icon.png" alt="Gmail">
+              </a>
+              <a href="https://github.com/eldar-elne" target="_blank">
+                  <img src="https://upload.wikimedia.org/wikipedia/commons/9/91/Octicons-mark-github.svg" alt="GitHub">
+              </a>
+          </div>
+          <p>&copy; 2024 Eldar Elnekave</p>
+      </footer>        
